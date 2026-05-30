@@ -1,0 +1,16 @@
+/target
+
+# Secrets — bot token, Google Maps key
+.env
+
+# Runtime state (chat IDs, work point, watched URLs, seen ad IDs)
+state.json
+state.json.tmp
+
+# Previous-version files that get migrated on first run
+old_ads_ids.txt
+old_ads_ids.txt.migrated
+
+# One-off scrape output and captured network traces
+listings.json
+*.har
