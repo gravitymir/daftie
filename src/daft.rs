@@ -17,6 +17,12 @@ pub struct DaftQuery {
     pub property_type: Option<String>,
     pub rental_price_from: Option<u32>,
     pub rental_price_to: Option<u32>,
+    /// GeoJSON polygon from a map-area URL's `polygon` query param (already
+    /// URL-decoded). When set, the search uses a custom-shape geo filter
+    /// (`BBOX_CUSTOM_SHAPES`) instead of the text `terms`/`area_slug`. These
+    /// are the `/property-for-rent/mapArea?...&polygon={...}` URLs produced by
+    /// drawing a custom area on Daft's map.
+    pub polygon: Option<serde_json::Value>,
 }
 
 impl DaftQuery {
@@ -42,11 +48,15 @@ impl DaftQuery {
 
         let mut rental_price_from = None;
         let mut rental_price_to = None;
+        let mut polygon = None;
 
         for (k, v) in parsed.query_pairs() {
             match k.as_ref() {
                 "rentalPrice_from" => rental_price_from = v.parse().ok(),
                 "rentalPrice_to" => rental_price_to = v.parse().ok(),
+                // `query_pairs()` already percent-decodes, so `v` is the raw
+                // GeoJSON string, e.g. `{"type":"Polygon","coordinates":[...]}`.
+                "polygon" => polygon = serde_json::from_str::<serde_json::Value>(&v).ok(),
                 _ => {}
             }
         }
@@ -57,6 +67,7 @@ impl DaftQuery {
             property_type,
             rental_price_from,
             rental_price_to,
+            polygon,
         })
     }
 }
@@ -239,6 +250,68 @@ pub async fn fetch_all(
     Ok(all)
 }
 
+/// Build the `geoFilter` object and `terms` string for the gateway request.
+///
+/// Custom map-area searches carry a drawn polygon and must use
+/// `BBOX_CUSTOM_SHAPES` with an empty `terms` — the `mapArea` path segment is
+/// not a real location. Ordinary slug searches use the text term +
+/// `STORED_SHAPES`.
+///
+/// The gateway rejects (`500`) a `polygon` sent on its own: it also needs the
+/// bounding box (`top`/`bottom`/`left`/`right`). We derive that box from the
+/// polygon's own coordinate extent so it always matches the shape.
+fn geo_filter_and_terms(query: &DaftQuery) -> (serde_json::Value, &str) {
+    match &query.polygon {
+        Some(poly) => {
+            let mut geo = json!({
+                "storedShapeIds": [],
+                "geoSearchType": "BBOX_CUSTOM_SHAPES",
+                "polygon": poly,
+            });
+            if let Some((top, bottom, left, right)) = polygon_bbox(poly) {
+                geo["top"] = json!(top);
+                geo["bottom"] = json!(bottom);
+                geo["left"] = json!(left);
+                geo["right"] = json!(right);
+            }
+            (geo, "")
+        }
+        None => (
+            json!({ "storedShapeIds": [], "geoSearchType": "STORED_SHAPES" }),
+            query.area_slug.as_str(),
+        ),
+    }
+}
+
+/// Bounding box of a GeoJSON `Polygon`, returned as
+/// `(top = max lat, bottom = min lat, left = min lng, right = max lng)`.
+/// GeoJSON coordinate pairs are `[lng, lat]`. Returns `None` if no numeric
+/// vertices were found.
+fn polygon_bbox(poly: &serde_json::Value) -> Option<(f64, f64, f64, f64)> {
+    let rings = poly.get("coordinates")?.as_array()?;
+    let (mut min_lng, mut max_lng) = (f64::INFINITY, f64::NEG_INFINITY);
+    let (mut min_lat, mut max_lat) = (f64::INFINITY, f64::NEG_INFINITY);
+    let mut any = false;
+    for ring in rings {
+        let Some(points) = ring.as_array() else { continue };
+        for pt in points {
+            let Some(arr) = pt.as_array() else { continue };
+            let (Some(lng), Some(lat)) = (
+                arr.first().and_then(|x| x.as_f64()),
+                arr.get(1).and_then(|x| x.as_f64()),
+            ) else {
+                continue;
+            };
+            min_lng = min_lng.min(lng);
+            max_lng = max_lng.max(lng);
+            min_lat = min_lat.min(lat);
+            max_lat = max_lat.max(lat);
+            any = true;
+        }
+    }
+    any.then_some((max_lat, min_lat, min_lng, max_lng))
+}
+
 async fn fetch_page(client: &Client, query: &DaftQuery, from: u32) -> Result<ApiResponse> {
     let mut filters = vec![json!({ "name": "adState", "values": ["published"] })];
     if let Some(pt) = &query.property_type {
@@ -247,14 +320,16 @@ async fn fetch_page(client: &Client, query: &DaftQuery, from: u32) -> Result<Api
         filters.push(json!({ "name": "propertyType", "values": [pt] }));
     }
 
+    let (geo_filter, terms) = geo_filter_and_terms(query);
+
     let body = json!({
         "section": query.section,
         "filters": filters,
         "andFilters": [],
         "ranges": [],
         "paging": { "from": from.to_string(), "pageSize": PAGE_SIZE.to_string() },
-        "geoFilter": { "storedShapeIds": [], "geoSearchType": "STORED_SHAPES" },
-        "terms": query.area_slug,
+        "geoFilter": geo_filter,
+        "terms": terms,
     });
 
     let resp = client
@@ -398,4 +473,58 @@ fn extract_next_data(html: &str) -> Result<&str> {
         .find("</script>")
         .ok_or_else(|| anyhow::anyhow!("__NEXT_DATA__ closing tag not found"))?;
     Ok(&html[after_open..after_open + end_rel])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const MAP_AREA_URL: &str = "https://www.daft.ie/property-for-rent/mapArea?rentalPrice_to=3000&showMap=true&geoSearchType=BBOX_CUSTOM_SHAPES&mapView=true&polygon={%22type%22:%22Polygon%22,%22coordinates%22:[[[-8.19,51.93],[-8.16,51.94],[-8.13,51.93],[-8.19,51.93]]]}";
+
+    #[test]
+    fn map_area_url_extracts_polygon_and_price() {
+        let q = DaftQuery::parse_url(MAP_AREA_URL).unwrap();
+        assert_eq!(q.section, "residential-to-rent");
+        assert_eq!(q.rental_price_to, Some(3000));
+        let poly = q.polygon.as_ref().expect("polygon should be parsed");
+        assert_eq!(poly["type"], "Polygon");
+        assert_eq!(poly["coordinates"][0][0][0], -8.19);
+    }
+
+    #[test]
+    fn map_area_uses_custom_shapes_not_the_maparea_term() {
+        // Regression: previously `terms` was "mapArea" with STORED_SHAPES,
+        // which text-searched for the literal word "mapArea" and returned 0.
+        let q = DaftQuery::parse_url(MAP_AREA_URL).unwrap();
+        let (geo, terms) = geo_filter_and_terms(&q);
+        assert_eq!(terms, "");
+        assert_eq!(geo["geoSearchType"], "BBOX_CUSTOM_SHAPES");
+        assert!(geo["polygon"]["coordinates"].is_array());
+        // The gateway 500s on a polygon without a bounding box; it must be
+        // derived from the polygon extent. Test polygon lngs span -8.19..-8.13,
+        // lats 51.93..51.94.
+        assert_eq!(geo["top"], 51.94);
+        assert_eq!(geo["bottom"], 51.93);
+        assert_eq!(geo["left"], -8.19);
+        assert_eq!(geo["right"], -8.13);
+    }
+
+    #[test]
+    fn polygon_bbox_computes_extent() {
+        let poly = serde_json::json!({
+            "type": "Polygon",
+            "coordinates": [[[-8.3, 51.90], [-8.1, 51.95], [-8.2, 51.88], [-8.3, 51.90]]],
+        });
+        let (top, bottom, left, right) = polygon_bbox(&poly).unwrap();
+        assert_eq!((top, bottom, left, right), (51.95, 51.88, -8.3, -8.1));
+    }
+
+    #[test]
+    fn slug_url_still_uses_terms_and_stored_shapes() {
+        let q = DaftQuery::parse_url("https://www.daft.ie/property-for-rent/cork-city").unwrap();
+        assert!(q.polygon.is_none());
+        let (geo, terms) = geo_filter_and_terms(&q);
+        assert_eq!(terms, "cork-city");
+        assert_eq!(geo["geoSearchType"], "STORED_SHAPES");
+    }
 }
