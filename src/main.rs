@@ -1,3 +1,4 @@
+mod audit;
 mod bot;
 mod daft;
 mod routing;
@@ -8,6 +9,7 @@ mod state;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use reqwest::Client;
+use std::net::TcpListener;
 use std::path::PathBuf;
 use std::sync::Arc;
 use teloxide::prelude::*;
@@ -90,6 +92,31 @@ async fn run_scrape(url: String, out: PathBuf, max_pages: u32) -> Result<()> {
     Ok(())
 }
 
+/// Acquire a process-wide single-instance lock for this bot token by binding a
+/// deterministic loopback TCP port. Returns the held listener (keep it alive for
+/// the whole run). If the port is already bound, another `daftie bot` for the
+/// same token is running and we bail with a clear message.
+fn acquire_instance_lock(bot_id: &str) -> Result<TcpListener> {
+    // Map the numeric bot id into the dynamic/private port range (49152–65535)
+    // so two different bots don't collide, and neither treads on well-known ports.
+    let n: u64 = bot_id.bytes().fold(0u64, |acc, b| acc.wrapping_mul(31).wrapping_add(b as u64));
+    let port: u16 = 49152 + (n % 16000) as u16;
+    match TcpListener::bind(("127.0.0.1", port)) {
+        Ok(listener) => {
+            log::info!("single-instance lock held (127.0.0.1:{port})");
+            Ok(listener)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+            anyhow::bail!(
+                "another daftie bot for this token is already running (lock port {port} is busy). \
+                 Refusing to start a second instance — it would send duplicate listings. \
+                 Stop the other process first (Windows: `tasklist | findstr daftie` then `taskkill /PID <pid> /F`)."
+            )
+        }
+        Err(e) => Err(e).context("binding single-instance lock port"),
+    }
+}
+
 async fn run_bot() -> Result<()> {
     let token = std::env::var("TELEGRAM_BOT_TOKEN")
         .map_err(|_| anyhow::anyhow!("TELEGRAM_BOT_TOKEN not set — fill it in .env"))?;
@@ -97,11 +124,14 @@ async fn run_bot() -> Result<()> {
         anyhow::bail!("TELEGRAM_BOT_TOKEN is empty — put your bot token in .env");
     }
 
-    log::info!(
-        "token loaded (id={}, len={})",
-        token.split(':').next().unwrap_or("?"),
-        token.len()
-    );
+    let bot_id: &str = token.split(':').next().unwrap_or("?");
+    log::info!("token loaded (id={bot_id}, len={})", token.len());
+
+    // Single-instance guard: bind a loopback port derived from this bot's id.
+    // A second `daftie bot` with the same token fails to bind and exits, so it
+    // can't run a parallel poll loop and re-send listings as duplicates.
+    // The lock is released automatically when the process exits (even on crash).
+    let _instance_lock = acquire_instance_lock(bot_id)?;
 
     let bot = Bot::new(token);
     let http = Client::builder().user_agent("daftie-rs/0.1").build()?;
@@ -122,6 +152,8 @@ async fn run_bot() -> Result<()> {
 
     let state_path = State::default_path();
     log::info!("state file: {}", state_path.display());
+    // Durable audit log lives next to state.json.
+    audit::init(state_path.with_file_name("events.log"));
     let state = Arc::new(Mutex::new(State::load(state_path).await?));
 
     {
@@ -137,6 +169,18 @@ async fn run_bot() -> Result<()> {
         log::info!(
             "state loaded: {chats} chat(s), {watches} watch(es), {} seen ad(s), {paused} stopped, {sleeping} sleeping",
             s.seen_count()
+        );
+        // Durable startup marker — lets us spot restarts (a new pid = a new
+        // process) and see exactly which ad IDs were already known at boot.
+        let mut ids: Vec<u64> = s.seen_ids.iter().copied().collect();
+        ids.sort_unstable();
+        audit::event(
+            "BOT_START",
+            format!(
+                "pid={} chats={chats} watches={watches} seen={} seen_ids={ids:?}",
+                std::process::id(),
+                s.seen_count(),
+            ),
         );
     }
 

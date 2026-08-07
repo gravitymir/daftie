@@ -42,7 +42,7 @@ pub enum Cmd {
     SleepTime(String),
     #[command(description = "only send ads that have a phone number: /filter_phone true|false")]
     FilterPhone(String),
-    #[command(description = "set work point: /work_point <lat>,<lng>, or 'off'")]
+    #[command(description = "set work point: /work_point <lat>,<lng> | <google maps url> | 'off'")]
     WorkPoint(String),
     #[command(description = "send a map image with all current ad locations")]
     Map,
@@ -150,7 +150,74 @@ fn has_phone(l: &crate::daft::Listing) -> bool {
 }
 
 /// Parse "lat,lng" or "lat lng" (with optional whitespace) into a coordinate pair.
+/// Pull `lat,lng` out of a Google Maps URL.
+/// Handles `?q=lat,lng`, `?ll=lat,lng`, `/@lat,lng,zoom`, and `!3dLAT!4dLNG`.
+fn coords_from_maps_url(s: &str) -> Option<(f64, f64)> {
+    let s = s.trim();
+    if !(s.starts_with("http://") || s.starts_with("https://")) {
+        return None;
+    }
+    let url = url::Url::parse(s).ok()?;
+    let host = url.host_str().unwrap_or("");
+    if !(host.contains("google.") && url.path().contains("map")
+        || host.contains("maps.google")
+        || host == "maps.app.goo.gl"
+        || host == "goo.gl")
+    {
+        return None;
+    }
+
+    // ?q=lat,lng or ?ll=lat,lng or ?query=lat,lng
+    for (k, v) in url.query_pairs() {
+        if matches!(k.as_ref(), "q" | "ll" | "query" | "daddr" | "center") {
+            if let Some(c) = pair_to_coords(&v) {
+                return Some(c);
+            }
+        }
+    }
+
+    // /@lat,lng,zoom  and  !3dLAT!4dLNG  live in the path
+    let path = url.path();
+    if let Some(at) = path.find("/@") {
+        if let Some(c) = pair_to_coords(&path[at + 2..]) {
+            return Some(c);
+        }
+    }
+    if let (Some(i3), Some(i4)) = (path.find("!3d"), path.find("!4d")) {
+        let lat = path[i3 + 3..]
+            .split(|c: char| !(c.is_ascii_digit() || c == '.' || c == '-'))
+            .next();
+        let lng = path[i4 + 3..]
+            .split(|c: char| !(c.is_ascii_digit() || c == '.' || c == '-'))
+            .next();
+        if let (Some(lat), Some(lng)) = (lat, lng) {
+            if let (Ok(lat), Ok(lng)) = (lat.parse(), lng.parse()) {
+                return Some((lat, lng));
+            }
+        }
+    }
+    None
+}
+
+/// Parse the first two comma/space-separated numbers of `s` as lat,lng.
+fn pair_to_coords(s: &str) -> Option<(f64, f64)> {
+    let mut it = s
+        .split(|c: char| c == ',' || c.is_whitespace())
+        .filter(|p| !p.is_empty())
+        .filter_map(|p| p.trim_end_matches('z').parse::<f64>().ok());
+    let lat = it.next()?;
+    let lng = it.next()?;
+    if (-90.0..=90.0).contains(&lat) && (-180.0..=180.0).contains(&lng) {
+        Some((lat, lng))
+    } else {
+        None
+    }
+}
+
 fn parse_coords(s: &str) -> Result<(f64, f64), String> {
+    if let Some((lat, lng)) = coords_from_maps_url(s) {
+        return Ok((lat, lng));
+    }
     let s = s.trim().trim_matches(|c| c == '(' || c == ')');
     let parts: Vec<&str> = s
         .split(|c: char| c == ',' || c.is_whitespace())
@@ -184,6 +251,10 @@ pub async fn handle_cmd(
         "[cmd] chat={chat_id} user={} -> {}",
         user_label(&msg),
         cmd_label(&cmd)
+    );
+    crate::audit::event(
+        "CMD",
+        format!("chat={chat_id} user={} cmd={}", user_label(&msg), cmd_label(&cmd)),
     );
 
     match cmd {
@@ -429,7 +500,7 @@ pub async fn handle_cmd(
                 bot.send_message(
                     msg.chat.id,
                     format!(
-                        "Current settings\n\n{summary}\n\nUsage:\n  /work_point 51.8985,-8.4756\n  /work_point off"
+                        "Current settings\n\n{summary}\n\nUsage:\n  /work_point 51.8985,-8.4756\n  /work_point https://www.google.com/maps?q=51.8985,-8.4756\n  /work_point off"
                     ),
                 )
                 .parse_mode(ParseMode::Html)
@@ -481,7 +552,7 @@ pub async fn handle_cmd(
                     bot.send_message(
                         msg.chat.id,
                         format!(
-                            "Bad coordinates: {e}\n\nTip: right-click your office on Google Maps, click the lat,lng to copy, paste here:\n  /work_point 51.8985,-8.4756"
+                            "Bad coordinates: {e}\n\nTip: paste a Google Maps link, or right-click your office on Google Maps and copy the lat,lng:\n  /work_point 51.8985,-8.4756\n  /work_point https://www.google.com/maps?q=51.8985,-8.4756"
                         ),
                     )
                     .await?;
@@ -494,10 +565,16 @@ pub async fn handle_cmd(
         Cmd::ClearHistory => {
             let removed = {
                 let mut s = state.lock().await;
+                let mut ids: Vec<u64> = s.seen_ids.iter().copied().collect();
+                ids.sort_unstable();
                 let n = s.clear_seen();
                 if let Err(e) = s.save().await {
                     log::warn!("[clear] save failed: {e}");
                 }
+                crate::audit::event(
+                    "CLEAR_HISTORY",
+                    format!("chat={chat_id} user={} removed={n} cleared_ids={ids:?}", user_label(&msg)),
+                );
                 n
             };
             log::info!("[clear] chat={chat_id} removed={removed} entries");
@@ -531,6 +608,10 @@ pub async fn handle_text(
             "[loc] chat={chat_id} user={} -> work_point {lat},{lng}",
             user_label(&msg)
         );
+        crate::audit::event(
+            "LOCATION",
+            format!("chat={chat_id} user={} work_point={lat},{lng}", user_label(&msg)),
+        );
 
         {
             let mut s = state.lock().await;
@@ -560,6 +641,10 @@ pub async fn handle_text(
         "[msg] chat={chat_id} user={} text={:?}",
         user_label(&msg),
         text
+    );
+    crate::audit::event(
+        "MSG",
+        format!("chat={chat_id} user={} text={:?}", user_label(&msg), short_url(text)),
     );
 
     if (text.starts_with("http://") || text.starts_with("https://")) && text.contains("daft.ie") {
@@ -679,9 +764,21 @@ async fn fetch_and_send_new(
         Ok(v) => v,
         Err(e) => {
             log::error!("[send] chat={} fetch failed for {url}: {e}", chat.0);
+            crate::audit::event("FETCH_ERR", format!("chat={} url={} err={e}", chat.0, short_url(url)));
             return;
         }
     };
+
+    // Record exactly what daft returned this cycle. If a duplicate is ever sent,
+    // this line shows whether the same ad IDs reappeared (daft re-listing) or the
+    // seen-set was reset out from under us (restart / clear / clobbered state).
+    {
+        let ids: Vec<u64> = listings.iter().map(|l| l.id).collect();
+        crate::audit::event(
+            "FETCH",
+            format!("chat={} url={} count={} ids={ids:?}", chat.0, short_url(url), ids.len()),
+        );
+    }
 
     let (filter_phone, work_point) = {
         let s = state.lock().await;
@@ -767,10 +864,20 @@ async fn fetch_and_send_new(
             Ok(()) => {
                 sent += 1;
                 let mut s = state.lock().await;
-                s.mark_seen(listing.id);
+                let newly = s.mark_seen(listing.id);
+                let seen_total = s.seen_count();
                 if let Err(e) = s.save().await {
                     log::warn!("[send] save state failed: {e}");
                 }
+                // `newly=false` here is the smoking gun: we just sent an ad whose
+                // ID was ALREADY in the seen-set — i.e. a genuine duplicate send.
+                crate::audit::event(
+                    "SENT",
+                    format!(
+                        "chat={} id={} newly_seen={newly} seen_total={seen_total} url={}",
+                        chat.0, listing.id, short_url(url)
+                    ),
+                );
             }
             Err(e) => {
                 failed += 1;
@@ -804,6 +911,23 @@ async fn fetch_and_send_new(
         "[send] chat={} url={url} fetched={fetched} sent={sent} skipped={skipped} filtered_no_phone={filtered_no_phone} failed={failed}",
         chat.0
     );
+    crate::audit::event(
+        "FETCH_DONE",
+        format!(
+            "chat={} url={} fetched={fetched} sent={sent} skipped_seen={skipped} filtered_no_phone={filtered_no_phone} failed={failed}",
+            chat.0, short_url(url)
+        ),
+    );
+}
+
+/// A compact, greppable signature of a (possibly huge map-area) watch URL:
+/// enough to tell `/sharing` from `/property-for-rent` and spot the `#id` anchor.
+fn short_url(u: &str) -> String {
+    let head: String = u.chars().take(48).collect();
+    match u.rsplit_once('#') {
+        Some((_, anchor)) if !anchor.is_empty() => format!("{head}…#{anchor}"),
+        _ => head,
+    }
 }
 
 async fn send_listing(
@@ -1076,6 +1200,10 @@ pub async fn poll_loop(
             "[poll] tick #{tick_n}: checking {} watch(es) (stopped={paused}, sleeping={sleeping})",
             snapshot.len()
         );
+        crate::audit::event(
+            "POLL_TICK",
+            format!("n={tick_n} watches={} stopped={paused} sleeping={sleeping}", snapshot.len()),
+        );
 
         for (chat_id, url) in snapshot {
             fetch_and_send_new(&bot, ChatId(chat_id), &url, &state, &http, &google_key).await;
@@ -1197,4 +1325,47 @@ async fn handle_map(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_coords;
+
+    fn approx(a: f64, b: f64) -> bool {
+        (a - b).abs() < 1e-6
+    }
+
+    #[test]
+    fn plain_coords() {
+        let (lat, lng) = parse_coords("51.917674,-8.186128").unwrap();
+        assert!(approx(lat, 51.917674) && approx(lng, -8.186128));
+    }
+
+    #[test]
+    fn maps_q_url() {
+        let (lat, lng) =
+            parse_coords("https://www.google.com/maps?q=51.917674,-8.186128&z=13").unwrap();
+        assert!(approx(lat, 51.917674) && approx(lng, -8.186128));
+    }
+
+    #[test]
+    fn maps_at_url() {
+        let (lat, lng) =
+            parse_coords("https://www.google.com/maps/place/Cork/@51.917674,-8.186128,13z").unwrap();
+        assert!(approx(lat, 51.917674) && approx(lng, -8.186128));
+    }
+
+    #[test]
+    fn maps_bang_url() {
+        let (lat, lng) = parse_coords(
+            "https://www.google.com/maps/place/X/data=!3m1!4b1!4m5!3d51.917674!4d-8.186128",
+        )
+        .unwrap();
+        assert!(approx(lat, 51.917674) && approx(lng, -8.186128));
+    }
+
+    #[test]
+    fn rejects_out_of_range() {
+        assert!(parse_coords("999,999").is_err());
+    }
 }
