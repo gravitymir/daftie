@@ -22,7 +22,7 @@ Paste a daft.ie search URL, get a rich card for every new ad: photos, price, pho
 - 🖼️ **Rich listing cards** — up to 3 photos plus price, bedrooms, property type, BER, seller, phone, preferences, facilities, date listed, and view count.
 - 🚗 **Commute times** — set a work point and each ad shows 🚗 driving · 🚶 walking · 🚴 cycling · 🚌 transit time (via Google Distance Matrix).
 - 📍 **Map overview** — `/map` renders every current listing as pins on a single static map.
-- ✉️ **One-tap enquiry text** — a reusable message template (`/message`) is delivered as a tap-to-copy block under each listing, pre-filled with its address and price, ready to paste into daft.ie's contact form.
+- ✉️ **One-tap enquiry text** — a reusable message template (`/message`) sits behind a **Show/Hide** button under each listing as a tap-to-copy block, plus a **Mark sent** button to track which advertisers you've already contacted.
 - 😴 **Quiet hours** — a sleep window pauses notifications overnight.
 - 📞 **Phone filter** — optionally skip ads with no phone number.
 - 💾 **Persistent state** — watches, settings, and seen-ad history survive restarts.
@@ -85,7 +85,8 @@ That's it — you'll get new listings as they're posted.
 | `/status` | Show current settings and all watched URLs |
 | `/check` | Force an immediate check now |
 | `/map` | Send a map image of all current listing locations |
-| `/message <text>` | Set the enquiry text sent under each listing (`default` loads a starter, `off` disables) |
+| `/message <text>` | Set the enquiry text shown under each listing (`default` loads a starter, `off` disables) |
+| `/message_address <on\|off>` | Prepend a `Re: <address>` line to the enquiry text (for email/forum contacts) |
 | `/work_point <lat>,<lng>` | Set your office for commute times (or `off`) |
 | `/sleep_time <HH:MM-HH:MM>` | Set quiet hours (or `off`) |
 | `/filter_phone <true\|false>` | Only send ads that include a phone number |
@@ -142,8 +143,8 @@ Price filters (`rentalPrice_from` / `rentalPrice_to`) in the URL are respected a
 
 daft.ie's "Message agent" form is protected by Google reCAPTCHA Enterprise and never exposes the advertiser's raw email, so daftie doesn't (and won't) auto-submit it — automated submissions get a low bot score and are silently dropped. Instead it removes the tedious part:
 
-1. Set your message once with `/message` — e.g. `/message default`, then edit to taste. Placeholders `{address}`, `{price}`, `{beds}`, and `{url}` are filled in per listing.
-2. Under every new listing, the bot posts that text as a **tap-to-copy** block.
+1. Set your message once with `/message` — e.g. `/message default`, then edit to taste. Placeholders `{address}`, `{price}`, `{beds}`, and `{url}` are filled in per listing. Use `/message_address on` to prepend the address for email/forum contacts.
+2. Under every new listing, a **✉️ Show enquiry text** button reveals that text as a **tap-to-copy** block (tap again to hide). A **☑️ Mark sent** button flips to **✅ Sent ✓** so you can see at a glance which listings you've already contacted — the state persists across restarts.
 3. Open the listing → **Message agent**, let your browser autofill your name/email/phone, copy-paste the enquiry text, and hit **Send** yourself.
 
 You do the single human click; the bot does the rest.

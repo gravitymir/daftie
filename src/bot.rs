@@ -8,7 +8,10 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use teloxide::{
     prelude::*,
-    types::{InputFile, InputMedia, InputMediaPhoto, ParseMode},
+    types::{
+        CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, InputFile, InputMedia,
+        InputMediaPhoto, MaybeInaccessibleMessage, ParseMode,
+    },
     utils::command::BotCommands,
 };
 use tokio::sync::Mutex;
@@ -48,6 +51,8 @@ pub enum Cmd {
     Map,
     #[command(description = "set the ready-to-paste enquiry text: /message <text> | 'default' | 'off'")]
     Message(String),
+    #[command(description = "add a 'Re: <address>' line atop the enquiry text (for email/forum): /message_address on|off")]
+    MessageAddress(String),
     #[command(description = "forget all sent ad IDs (next check re-sends every ad)")]
     ClearHistory,
 }
@@ -79,13 +84,16 @@ fn cmd_label(cmd: &Cmd) -> &'static str {
         Cmd::WorkPoint(_) => "/work_point",
         Cmd::Map => "/map",
         Cmd::Message(_) => "/message",
+        Cmd::MessageAddress(_) => "/message_address",
         Cmd::ClearHistory => "/clear_history",
     }
 }
 
-/// A sensible starting enquiry, loaded with `/message default`.
-const DEFAULT_ENQUIRY: &str = "Hi, I'm interested in the property at {address} ({price}). \
-Is it still available to rent? I'd love to arrange a viewing at your convenience. Thank you!";
+/// A sensible starting enquiry, loaded with `/message default`. Deliberately
+/// address-free: the daft.ie form already knows the listing. Use
+/// `/message_address on` to prepend the address for email/forum contacts.
+const DEFAULT_ENQUIRY: &str = "Hi, I'm interested in renting this property. \
+Is it still available? I'd love to arrange a viewing at your convenience. Thank you!";
 
 /// Substitute `{address}`/`{price}`/`{beds}`/`{url}` placeholders in an enquiry
 /// template with a listing's details. Unknown placeholders are left untouched.
@@ -147,8 +155,9 @@ fn render_state_summary(s: &State, chat_id: i64, current_url: Option<&str>) -> S
         None => out.push_str("🏢 Work point: <b>off</b>\n"),
     }
     out.push_str(&format!(
-        "✉️ Enquiry text: <b>{}</b>\n",
-        if c.and_then(|c| c.enquiry_template.as_ref()).is_some() { "on" } else { "off" }
+        "✉️ Enquiry text: <b>{}</b>{}\n",
+        if c.and_then(|c| c.enquiry_template.as_ref()).is_some() { "on" } else { "off" },
+        if c.map(|c| c.enquiry_include_address).unwrap_or(false) { " (+address)" } else { "" }
     ));
     out.push_str(&format!("Watches: <b>{watch_count}</b>\n"));
     out.push_str(&format!("Sent ads recorded: <b>{}</b>", s.seen_count()));
@@ -644,6 +653,42 @@ pub async fn handle_cmd(
             .parse_mode(ParseMode::Html)
             .await?;
         }
+        Cmd::MessageAddress(arg) => {
+            let arg = arg.trim();
+            if arg.is_empty() {
+                let on = {
+                    let s = state.lock().await;
+                    s.chat_get(chat_id).map(|c| c.enquiry_include_address).unwrap_or(false)
+                };
+                bot.send_message(
+                    msg.chat.id,
+                    format!(
+                        "Address line is <b>{}</b>.\n\nWhen on, the enquiry text gets a 'Re: &lt;address&gt;' line on top — handy for email/forum contacts. Leave it off for daft.ie's form (it already knows the listing).\n\nUsage:\n  /message_address on\n  /message_address off",
+                        if on { "on" } else { "off" }
+                    ),
+                )
+                .parse_mode(ParseMode::Html)
+                .await?;
+                return Ok(());
+            }
+
+            let Some(value) = parse_bool_arg(arg) else {
+                bot.send_message(msg.chat.id, "Bad value. Use /message_address on or /message_address off.")
+                    .await?;
+                return Ok(());
+            };
+            {
+                let mut s = state.lock().await;
+                s.chat_mut(chat_id).enquiry_include_address = value;
+                let _ = s.save().await;
+            }
+            let reply = if value {
+                "Address line ON — each enquiry text now starts with 'Re: <address>'."
+            } else {
+                "Address line OFF — enquiry text is sent without the address (daft.ie form knows the listing)."
+            };
+            bot.send_message(msg.chat.id, reply).await?;
+        }
         Cmd::ClearHistory => {
             let removed = {
                 let mut s = state.lock().await;
@@ -862,13 +907,14 @@ async fn fetch_and_send_new(
         );
     }
 
-    let (filter_phone, work_point, enquiry_template) = {
+    let (filter_phone, work_point, enquiry_template, enquiry_include_address) = {
         let s = state.lock().await;
         let c = s.chat_get(chat.0);
         (
             c.map(|c| c.filter_phone).unwrap_or(false),
             c.and_then(|c| c.work_point),
             c.and_then(|c| c.enquiry_template.clone()),
+            c.map(|c| c.enquiry_include_address).unwrap_or(false),
         )
     };
 
@@ -947,11 +993,25 @@ async fn fetch_and_send_new(
             Ok(()) => {
                 sent += 1;
 
-                // Ready-to-paste enquiry text, tied to this listing.
+                // Ready-to-paste enquiry text, behind a toggle button under the
+                // listing. Store the text keyed by the button's message id so
+                // the callback can reveal it (survives restarts via state.json).
                 if let Some(tmpl) = &enquiry_template {
                     tokio::time::sleep(SEND_GAP).await;
-                    if let Err(e) = send_enquiry_text(bot, chat, tmpl, &listing).await {
-                        log::warn!("[send] chat={} id={} enquiry text failed: {e}", chat.0, listing.id);
+                    match send_enquiry_button(bot, chat).await {
+                        Ok(btn_msg) => {
+                            let text = compose_enquiry(tmpl, &listing, enquiry_include_address);
+                            let mut s = state.lock().await;
+                            s.store_enquiry(chat.0, btn_msg.id.0, text);
+                            if let Err(e) = s.save().await {
+                                log::warn!("[send] save enquiry text failed: {e}");
+                            }
+                        }
+                        Err(e) => log::warn!(
+                            "[send] chat={} id={} enquiry button failed: {e}",
+                            chat.0,
+                            listing.id
+                        ),
                     }
                 }
 
@@ -1022,23 +1082,132 @@ fn short_url(u: &str) -> String {
     }
 }
 
-/// Send the ready-to-paste enquiry text for a listing as a tap-to-copy `<pre>`
-/// block. The lead-in line sits outside the block so only the message body is
-/// copied when the user taps it.
-async fn send_enquiry_text(
+/// Collapsed label of the enquiry toggle message (button shown, text hidden).
+const ENQUIRY_COLLAPSED: &str = "✉️ Enquiry for this listing";
+/// First line of the expanded toggle message; used to detect current state.
+const ENQUIRY_EXPANDED_PREFIX: &str = "✉️ Enquiry text (tap to copy):";
+/// Marker line prepended once the user marks the enquiry sent.
+const ENQUIRY_SENT_MARK: &str = "✅ Sent";
+/// callback_data for the show/hide button and the mark-sent button.
+const CB_TOGGLE: &str = "enq_t";
+const CB_SENT: &str = "enq_s";
+
+/// Fill and (optionally) prefix the enquiry text with a `Re: <address>` header
+/// for email/forum contacts not tied to a listing.
+fn compose_enquiry(template: &str, l: &Listing, include_address: bool) -> String {
+    let body = fill_template(template, l);
+    if include_address {
+        format!("Re: {}\n\n{}", l.title, body)
+    } else {
+        body
+    }
+}
+
+fn enquiry_keyboard(collapsed: bool, sent: bool) -> InlineKeyboardMarkup {
+    let toggle = InlineKeyboardButton::callback(
+        if collapsed { "✉️ Show enquiry text" } else { "🙈 Hide" },
+        CB_TOGGLE,
+    );
+    let sent_btn = InlineKeyboardButton::callback(
+        if sent { "✅ Sent ✓" } else { "☑️ Mark sent" },
+        CB_SENT,
+    );
+    InlineKeyboardMarkup::new([[toggle], [sent_btn]])
+}
+
+/// Render the enquiry message body for a given expanded/sent state.
+/// `text` is only used when expanded. Output may contain HTML (`<pre>`), so it
+/// must be sent with `ParseMode::Html`.
+fn render_enquiry(text: &str, expanded: bool, sent: bool) -> String {
+    let mut out = String::new();
+    if sent {
+        out.push_str(ENQUIRY_SENT_MARK);
+        out.push('\n');
+    }
+    if expanded {
+        out.push_str(ENQUIRY_EXPANDED_PREFIX);
+        out.push_str(&format!("\n<pre>{}</pre>", html_escape(text)));
+    } else {
+        out.push_str(ENQUIRY_COLLAPSED);
+    }
+    out
+}
+
+/// Send the collapsed toggle message (buttons only) under a listing. The caller
+/// stores the composed text keyed by the returned message id.
+async fn send_enquiry_button(
     bot: &Bot,
     chat: ChatId,
-    template: &str,
-    l: &Listing,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let filled = fill_template(template, l);
-    let text = format!(
-        "✉️ Enquiry text (tap to copy):\n<pre>{}</pre>",
-        html_escape(&filled)
-    );
-    bot.send_message(chat, text)
+) -> Result<Message, Box<dyn std::error::Error + Send + Sync>> {
+    let msg = bot
+        .send_message(chat, render_enquiry("", false, false))
         .parse_mode(ParseMode::Html)
+        .reply_markup(enquiry_keyboard(true, false))
         .await?;
+    Ok(msg)
+}
+
+/// Handle a tap on an enquiry button: the show/hide toggle reveals or collapses
+/// the copyable `<pre>` block; the mark-sent button flips a persisted "sent"
+/// marker so the listing reads as already contacted when scrolled back to.
+pub async fn handle_callback(
+    bot: Bot,
+    q: CallbackQuery,
+    state: SharedState,
+) -> ResponseResult<()> {
+    let Some(MaybeInaccessibleMessage::Regular(msg)) = q.message else {
+        bot.answer_callback_query(q.id).await?;
+        return Ok(());
+    };
+    let chat_id = msg.chat.id;
+    let message_id = msg.id;
+
+    let entry = {
+        let s = state.lock().await;
+        s.get_enquiry(chat_id.0, message_id.0).cloned()
+    };
+    let Some(entry) = entry else {
+        bot.answer_callback_query(q.id)
+            .text("This button expired — run /check to refresh listings.")
+            .show_alert(true)
+            .await?;
+        return Ok(());
+    };
+
+    let expanded_now = msg
+        .text()
+        .map(|t| t.contains(ENQUIRY_EXPANDED_PREFIX))
+        .unwrap_or(false);
+    let data = q.data.as_deref().unwrap_or("");
+
+    let (expanded, sent, toast) = match data {
+        CB_TOGGLE => (!expanded_now, entry.sent, None),
+        CB_SENT => {
+            let new_sent = !entry.sent;
+            {
+                let mut s = state.lock().await;
+                s.set_enquiry_sent(chat_id.0, message_id.0, new_sent);
+                if let Err(e) = s.save().await {
+                    log::warn!("[cb] save sent flag failed: {e}");
+                }
+            }
+            let toast = if new_sent { "Marked as sent ✓" } else { "Unmarked" };
+            (expanded_now, new_sent, Some(toast))
+        }
+        _ => (expanded_now, entry.sent, None),
+    };
+
+    let body = render_enquiry(&entry.text, expanded, sent);
+    bot.edit_message_text(chat_id, message_id, body)
+        .parse_mode(ParseMode::Html)
+        .reply_markup(enquiry_keyboard(!expanded, sent))
+        .await?;
+
+    let mut ack = bot.answer_callback_query(q.id);
+    if let Some(t) = toast {
+        ack = ack.text(t);
+    }
+    ack.await?;
     Ok(())
 }
 

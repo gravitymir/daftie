@@ -219,13 +219,17 @@ async fn run_bot() -> Result<()> {
 
     log::info!("dispatcher ready; awaiting messages…");
 
-    let handler = Update::filter_message()
+    let handler = dptree::entry()
         .branch(
-            dptree::entry()
-                .filter_command::<bot::Cmd>()
-                .endpoint(bot::handle_cmd),
+            Update::filter_message()
+                .branch(
+                    dptree::entry()
+                        .filter_command::<bot::Cmd>()
+                        .endpoint(bot::handle_cmd),
+                )
+                .branch(dptree::endpoint(bot::handle_text)),
         )
-        .branch(dptree::endpoint(bot::handle_text));
+        .branch(Update::filter_callback_query().endpoint(bot::handle_callback));
 
     Dispatcher::builder(bot, handler)
         .dependencies(dptree::deps![state, http, google_key])

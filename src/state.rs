@@ -14,8 +14,29 @@ pub struct State {
     #[serde(default)]
     pub seen_ids: HashSet<u64>,
 
+    /// Per-listing enquiry state behind each toggle button, keyed by
+    /// `"<chat_id>:<button_message_id>"`. Persisted so the buttons keep working
+    /// across restarts. Capped to the newest `MAX_ENQUIRY_TEXTS`.
+    #[serde(default)]
+    pub enquiry_texts: HashMap<String, EnquiryEntry>,
+
     #[serde(skip)]
     file_path: PathBuf,
+}
+
+/// The copyable enquiry text plus whether the user marked it as sent.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EnquiryEntry {
+    pub text: String,
+    #[serde(default)]
+    pub sent: bool,
+}
+
+/// Upper bound on stored enquiry-button entries; oldest are pruned past this.
+const MAX_ENQUIRY_TEXTS: usize = 500;
+
+fn enquiry_key(chat_id: i64, message_id: i32) -> String {
+    format!("{chat_id}:{message_id}")
 }
 
 impl Default for State {
@@ -23,6 +44,7 @@ impl Default for State {
         Self {
             chats: HashMap::new(),
             seen_ids: HashSet::new(),
+            enquiry_texts: HashMap::new(),
             file_path: PathBuf::new(),
         }
     }
@@ -58,6 +80,12 @@ pub struct ChatState {
     /// this text, with `{address}`/`{price}`/`{beds}`/`{url}` substituted.
     #[serde(default)]
     pub enquiry_template: Option<String>,
+
+    /// Prepend a `Re: <address>` header to the enquiry copy-block. Useful for
+    /// email/forum contacts that aren't tied to a listing; the daft.ie form
+    /// already knows the property, so this stays off by default.
+    #[serde(default)]
+    pub enquiry_include_address: bool,
 }
 
 fn default_true() -> bool {
@@ -73,6 +101,7 @@ impl Default for ChatState {
             filter_phone: false,
             work_point: None,
             enquiry_template: None,
+            enquiry_include_address: false,
         }
     }
 }
@@ -245,5 +274,42 @@ impl State {
 
     pub fn seen_count(&self) -> usize {
         self.seen_ids.len()
+    }
+
+    /// Store the enquiry text for a toggle button, pruning the oldest entries
+    /// (by message id) once past the cap.
+    pub fn store_enquiry(&mut self, chat_id: i64, message_id: i32, text: String) {
+        self.enquiry_texts.insert(
+            enquiry_key(chat_id, message_id),
+            EnquiryEntry { text, sent: false },
+        );
+        if self.enquiry_texts.len() > MAX_ENQUIRY_TEXTS {
+            let mut keys: Vec<String> = self.enquiry_texts.keys().cloned().collect();
+            // Sort by the numeric message-id suffix; smallest (oldest) first.
+            keys.sort_by_key(|k| {
+                k.rsplit_once(':')
+                    .and_then(|(_, m)| m.parse::<i64>().ok())
+                    .unwrap_or(0)
+            });
+            let remove = self.enquiry_texts.len() - MAX_ENQUIRY_TEXTS;
+            for k in keys.into_iter().take(remove) {
+                self.enquiry_texts.remove(&k);
+            }
+        }
+    }
+
+    pub fn get_enquiry(&self, chat_id: i64, message_id: i32) -> Option<&EnquiryEntry> {
+        self.enquiry_texts.get(&enquiry_key(chat_id, message_id))
+    }
+
+    /// Mark an enquiry entry sent/unsent. Returns false if the key is unknown.
+    pub fn set_enquiry_sent(&mut self, chat_id: i64, message_id: i32, sent: bool) -> bool {
+        match self.enquiry_texts.get_mut(&enquiry_key(chat_id, message_id)) {
+            Some(e) => {
+                e.sent = sent;
+                true
+            }
+            None => false,
+        }
     }
 }
