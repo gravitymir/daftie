@@ -52,6 +52,12 @@ pub struct ChatState {
     /// drive/walk/bike/transit times to each listing.
     #[serde(default)]
     pub work_point: Option<[f64; 2]>,
+
+    /// Ready-to-paste enquiry text for daft.ie's "Message agent" form.
+    /// When set, each sent listing is followed by a tap-to-copy block with
+    /// this text, with `{address}`/`{price}`/`{beds}`/`{url}` substituted.
+    #[serde(default)]
+    pub enquiry_template: Option<String>,
 }
 
 fn default_true() -> bool {
@@ -66,6 +72,7 @@ impl Default for ChatState {
             sleep: None,
             filter_phone: false,
             work_point: None,
+            enquiry_template: None,
         }
     }
 }

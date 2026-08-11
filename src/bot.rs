@@ -46,6 +46,8 @@ pub enum Cmd {
     WorkPoint(String),
     #[command(description = "send a map image with all current ad locations")]
     Map,
+    #[command(description = "set the ready-to-paste enquiry text: /message <text> | 'default' | 'off'")]
+    Message(String),
     #[command(description = "forget all sent ad IDs (next check re-sends every ad)")]
     ClearHistory,
 }
@@ -76,8 +78,23 @@ fn cmd_label(cmd: &Cmd) -> &'static str {
         Cmd::FilterPhone(_) => "/filter_phone",
         Cmd::WorkPoint(_) => "/work_point",
         Cmd::Map => "/map",
+        Cmd::Message(_) => "/message",
         Cmd::ClearHistory => "/clear_history",
     }
+}
+
+/// A sensible starting enquiry, loaded with `/message default`.
+const DEFAULT_ENQUIRY: &str = "Hi, I'm interested in the property at {address} ({price}). \
+Is it still available to rent? I'd love to arrange a viewing at your convenience. Thank you!";
+
+/// Substitute `{address}`/`{price}`/`{beds}`/`{url}` placeholders in an enquiry
+/// template with a listing's details. Unknown placeholders are left untouched.
+fn fill_template(template: &str, l: &Listing) -> String {
+    template
+        .replace("{address}", &l.title)
+        .replace("{price}", l.price.as_deref().unwrap_or(""))
+        .replace("{beds}", l.bedrooms.as_deref().unwrap_or(""))
+        .replace("{url}", &l.url)
 }
 
 /// Multi-line state summary used in /watch, /status and /start_watching replies.
@@ -129,6 +146,10 @@ fn render_state_summary(s: &State, chat_id: i64, current_url: Option<&str>) -> S
         )),
         None => out.push_str("🏢 Work point: <b>off</b>\n"),
     }
+    out.push_str(&format!(
+        "✉️ Enquiry text: <b>{}</b>\n",
+        if c.and_then(|c| c.enquiry_template.as_ref()).is_some() { "on" } else { "off" }
+    ));
     out.push_str(&format!("Watches: <b>{watch_count}</b>\n"));
     out.push_str(&format!("Sent ads recorded: <b>{}</b>", s.seen_count()));
     out
@@ -562,6 +583,67 @@ pub async fn handle_cmd(
         Cmd::Map => {
             handle_map(&bot, msg.chat.id, &state, &http, &google_key).await?;
         }
+        Cmd::Message(arg) => {
+            let arg = arg.trim();
+            let lower = arg.to_lowercase();
+
+            // Show current template + usage.
+            if arg.is_empty() {
+                let current = {
+                    let s = state.lock().await;
+                    s.chat_get(chat_id).and_then(|c| c.enquiry_template.clone())
+                };
+                let body = match current {
+                    Some(t) => format!(
+                        "Current enquiry text (sent as a tap-to-copy block under each listing):\n\n<pre>{}</pre>",
+                        html_escape(&t)
+                    ),
+                    None => "No enquiry text set. It's added under each listing so you can paste it into daft.ie's \"Message agent\" form.".to_string(),
+                };
+                bot.send_message(
+                    msg.chat.id,
+                    format!(
+                        "{body}\n\nUsage:\n  /message &lt;your text&gt;\n  /message default  (load a starter)\n  /message off\n\nPlaceholders: <code>{{address}}</code> <code>{{price}}</code> <code>{{beds}}</code> <code>{{url}}</code>"
+                    ),
+                )
+                .parse_mode(ParseMode::Html)
+                .await?;
+                return Ok(());
+            }
+
+            // Disable.
+            if matches!(lower.as_str(), "off" | "none" | "clear" | "-") {
+                {
+                    let mut s = state.lock().await;
+                    s.chat_mut(chat_id).enquiry_template = None;
+                    let _ = s.save().await;
+                }
+                bot.send_message(msg.chat.id, "Enquiry text cleared — listings will no longer include a copy block.")
+                    .await?;
+                return Ok(());
+            }
+
+            // Set (either the built-in default or the user's own text).
+            let template = if lower == "default" {
+                DEFAULT_ENQUIRY.to_string()
+            } else {
+                arg.to_string()
+            };
+            {
+                let mut s = state.lock().await;
+                s.chat_mut(chat_id).enquiry_template = Some(template.clone());
+                let _ = s.save().await;
+            }
+            bot.send_message(
+                msg.chat.id,
+                format!(
+                    "Enquiry text saved. It'll appear as a tap-to-copy block under each new listing:\n\n<pre>{}</pre>",
+                    html_escape(&template)
+                ),
+            )
+            .parse_mode(ParseMode::Html)
+            .await?;
+        }
         Cmd::ClearHistory => {
             let removed = {
                 let mut s = state.lock().await;
@@ -780,12 +862,13 @@ async fn fetch_and_send_new(
         );
     }
 
-    let (filter_phone, work_point) = {
+    let (filter_phone, work_point, enquiry_template) = {
         let s = state.lock().await;
         let c = s.chat_get(chat.0);
         (
             c.map(|c| c.filter_phone).unwrap_or(false),
             c.and_then(|c| c.work_point),
+            c.and_then(|c| c.enquiry_template.clone()),
         )
     };
 
@@ -863,6 +946,15 @@ async fn fetch_and_send_new(
         match send_listing(bot, chat, &listing, extras.as_ref(), commute.as_ref()).await {
             Ok(()) => {
                 sent += 1;
+
+                // Ready-to-paste enquiry text, tied to this listing.
+                if let Some(tmpl) = &enquiry_template {
+                    tokio::time::sleep(SEND_GAP).await;
+                    if let Err(e) = send_enquiry_text(bot, chat, tmpl, &listing).await {
+                        log::warn!("[send] chat={} id={} enquiry text failed: {e}", chat.0, listing.id);
+                    }
+                }
+
                 let mut s = state.lock().await;
                 let newly = s.mark_seen(listing.id);
                 let seen_total = s.seen_count();
@@ -928,6 +1020,26 @@ fn short_url(u: &str) -> String {
         Some((_, anchor)) if !anchor.is_empty() => format!("{head}…#{anchor}"),
         _ => head,
     }
+}
+
+/// Send the ready-to-paste enquiry text for a listing as a tap-to-copy `<pre>`
+/// block. The lead-in line sits outside the block so only the message body is
+/// copied when the user taps it.
+async fn send_enquiry_text(
+    bot: &Bot,
+    chat: ChatId,
+    template: &str,
+    l: &Listing,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let filled = fill_template(template, l);
+    let text = format!(
+        "✉️ Enquiry text (tap to copy):\n<pre>{}</pre>",
+        html_escape(&filled)
+    );
+    bot.send_message(chat, text)
+        .parse_mode(ParseMode::Html)
+        .await?;
+    Ok(())
 }
 
 async fn send_listing(
