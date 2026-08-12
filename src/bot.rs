@@ -986,7 +986,9 @@ pub async fn handle_text(
 
     if (text.starts_with("http://") || text.starts_with("https://")) && text.contains("daft.ie") {
         do_watch(&bot, msg.chat.id, text, &state, &http, &google_key).await?;
-    } else {
+    } else if msg.chat.is_private() {
+        // Only nudge in a one-to-one chat. In groups the bot stays silent on
+        // anything it doesn't recognise, so it never interrupts conversation.
         bot.send_message(
             msg.chat.id,
             "Send a daft.ie URL, share a Location (sets work point), or use /help.",
