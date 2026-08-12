@@ -9,6 +9,7 @@ mod state;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use reqwest::Client;
+use std::collections::HashSet;
 use std::net::TcpListener;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -117,6 +118,34 @@ fn acquire_instance_lock(bot_id: &str) -> Result<TcpListener> {
     }
 }
 
+/// Parse `ADMIN_CHAT_ID` — the single chat that manages the allowlist and is
+/// always served. `None` if unset/blank.
+fn parse_admin() -> Option<i64> {
+    let raw = std::env::var("ADMIN_CHAT_ID").ok()?;
+    match raw.trim().parse::<i64>() {
+        Ok(id) => Some(id),
+        Err(_) if raw.trim().is_empty() => None,
+        Err(_) => {
+            log::warn!("ADMIN_CHAT_ID {raw:?} is not a valid chat id — ignoring");
+            None
+        }
+    }
+}
+
+/// Parse `ALLOWED_CHAT_IDS` (comma/space/semicolon-separated) — used once to
+/// seed the persistent allowlist on first run.
+fn parse_seed_chats() -> HashSet<i64> {
+    std::env::var("ALLOWED_CHAT_IDS")
+        .ok()
+        .map(|raw| {
+            raw.split(|c: char| c == ',' || c == ';' || c.is_whitespace())
+                .filter(|p| !p.is_empty())
+                .filter_map(|p| p.parse::<i64>().ok())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 async fn run_bot() -> Result<()> {
     let token = std::env::var("TELEGRAM_BOT_TOKEN")
         .map_err(|_| anyhow::anyhow!("TELEGRAM_BOT_TOKEN not set — fill it in .env"))?;
@@ -150,11 +179,44 @@ async fn run_bot() -> Result<()> {
     }
     let google_key: Arc<Option<String>> = Arc::new(google_key);
 
+    // Admin chat (manages the allowlist, always served) from `ADMIN_CHAT_ID`.
+    let admin: bot::SharedAdmin = Arc::new(parse_admin());
+
     let state_path = State::default_path();
     log::info!("state file: {}", state_path.display());
     // Durable audit log lives next to state.json.
     audit::init(state_path.with_file_name("events.log"));
     let state = Arc::new(Mutex::new(State::load(state_path).await?));
+
+    // First-run bootstrap: seed the persistent allowlist from `ALLOWED_CHAT_IDS`
+    // (and always include the admin) so the very first launch is already locked
+    // down. After this, the list is managed live via /allow and /deny.
+    {
+        let mut s = state.lock().await;
+        if s.allowlist_is_empty() {
+            let mut seed = parse_seed_chats();
+            if let Some(a) = *admin {
+                seed.insert(a);
+            }
+            for id in &seed {
+                s.allow_chat(*id, "");
+            }
+            if !seed.is_empty() {
+                let _ = s.save().await;
+                log::info!("seeded allowlist with {} chat(s) from ALLOWED_CHAT_IDS/ADMIN_CHAT_ID", seed.len());
+            }
+        }
+        match *admin {
+            Some(a) => log::info!(
+                "admin chat = {a}; allowlist has {} chat(s) — all others ignored",
+                s.allowed_chats.len()
+            ),
+            None if s.allowlist_is_empty() => {
+                log::warn!("no ADMIN_CHAT_ID and empty allowlist — bot serves ANY chat")
+            }
+            None => log::warn!("no ADMIN_CHAT_ID set — allowlist enforced but nobody can manage it via Telegram"),
+        }
+    }
 
     {
         let s = state.lock().await;
@@ -212,8 +274,9 @@ async fn run_bot() -> Result<()> {
         let state_c = state.clone();
         let http_c = http.clone();
         let key_c = google_key.clone();
+        let admin_c = admin.clone();
         tokio::spawn(async move {
-            bot::poll_loop(bot_c, state_c, http_c, key_c, poll_interval).await;
+            bot::poll_loop(bot_c, state_c, http_c, key_c, admin_c, poll_interval).await;
         });
     }
 
@@ -232,7 +295,7 @@ async fn run_bot() -> Result<()> {
         .branch(Update::filter_callback_query().endpoint(bot::handle_callback));
 
     Dispatcher::builder(bot, handler)
-        .dependencies(dptree::deps![state, http, google_key])
+        .dependencies(dptree::deps![state, http, google_key, admin])
         .enable_ctrlc_handler()
         .build()
         .dispatch()

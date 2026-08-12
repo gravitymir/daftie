@@ -20,6 +20,12 @@ pub struct State {
     #[serde(default)]
     pub enquiry_texts: HashMap<String, EnquiryEntry>,
 
+    /// Allowlist of chats permitted to use the bot: chat id (as string, for
+    /// JSON) → human-readable label (title / name). Managed by the admin via
+    /// `/allow` and `/deny`. The admin chat is always allowed regardless.
+    #[serde(default)]
+    pub allowed_chats: HashMap<String, String>,
+
     #[serde(skip)]
     file_path: PathBuf,
 }
@@ -45,6 +51,7 @@ impl Default for State {
             chats: HashMap::new(),
             seen_ids: HashSet::new(),
             enquiry_texts: HashMap::new(),
+            allowed_chats: HashMap::new(),
             file_path: PathBuf::new(),
         }
     }
@@ -274,6 +281,49 @@ impl State {
 
     pub fn seen_count(&self) -> usize {
         self.seen_ids.len()
+    }
+
+    // ---- chat allowlist -------------------------------------------------
+
+    pub fn is_chat_allowed(&self, chat_id: i64) -> bool {
+        self.allowed_chats.contains_key(&chat_id.to_string())
+    }
+
+    pub fn allowlist_is_empty(&self) -> bool {
+        self.allowed_chats.is_empty()
+    }
+
+    /// Add a chat (or refresh its label). Returns true if it was newly added.
+    pub fn allow_chat(&mut self, chat_id: i64, label: &str) -> bool {
+        let key = chat_id.to_string();
+        let existed = self.allowed_chats.contains_key(&key);
+        self.allowed_chats.insert(key, label.to_string());
+        !existed
+    }
+
+    /// Remove a chat from the allowlist. Returns true if it was present.
+    pub fn deny_chat(&mut self, chat_id: i64) -> bool {
+        self.allowed_chats.remove(&chat_id.to_string()).is_some()
+    }
+
+    /// Update the stored label of an already-allowed chat (no-op otherwise).
+    pub fn touch_chat_label(&mut self, chat_id: i64, label: &str) {
+        if let Some(slot) = self.allowed_chats.get_mut(&chat_id.to_string()) {
+            if !label.is_empty() && slot.as_str() != label {
+                *slot = label.to_string();
+            }
+        }
+    }
+
+    /// Allowed chats as `(id, label)`, sorted by id.
+    pub fn allowed_list(&self) -> Vec<(i64, String)> {
+        let mut v: Vec<(i64, String)> = self
+            .allowed_chats
+            .iter()
+            .map(|(k, label)| (k.parse::<i64>().unwrap_or(0), label.clone()))
+            .collect();
+        v.sort_by_key(|(id, _)| *id);
+        v
     }
 
     /// Store the enquiry text for a toggle button, pruning the oldest entries

@@ -18,6 +18,47 @@ use tokio::sync::Mutex;
 
 pub type SharedState = Arc<Mutex<State>>;
 pub type SharedKey = Arc<Option<String>>;
+/// The admin chat id (from `ADMIN_CHAT_ID`). The admin is always served and is
+/// the only chat allowed to manage the allowlist. `None` = no admin configured.
+pub type SharedAdmin = Arc<Option<i64>>;
+
+/// Whether `chat_id` is the configured admin.
+pub fn is_admin(admin: Option<i64>, chat_id: i64) -> bool {
+    admin == Some(chat_id)
+}
+
+/// Whether `chat_id` may use the bot at all. When neither an admin nor any
+/// allowlisted chat is configured the bot is open to everyone (backward
+/// compatible); otherwise only the admin and allowlisted chats are served.
+pub fn chat_served(state: &State, admin: Option<i64>, chat_id: i64) -> bool {
+    if admin.is_none() && state.allowlist_is_empty() {
+        return true;
+    }
+    admin == Some(chat_id) || state.is_chat_allowed(chat_id)
+}
+
+/// Human-readable label for a chat: group title, or person's name/username,
+/// falling back to the numeric id.
+pub fn chat_label(chat: &teloxide::types::Chat) -> String {
+    if let Some(t) = chat.title() {
+        return t.to_string();
+    }
+    let mut parts = Vec::new();
+    if let Some(f) = chat.first_name() {
+        parts.push(f.to_string());
+    }
+    if let Some(l) = chat.last_name() {
+        parts.push(l.to_string());
+    }
+    if let Some(u) = chat.username() {
+        parts.push(format!("@{u}"));
+    }
+    if parts.is_empty() {
+        format!("chat {}", chat.id.0)
+    } else {
+        parts.join(" ")
+    }
+}
 
 /// Pause between two outgoing messages to keep under Telegram's per-chat rate limit.
 const SEND_GAP: Duration = Duration::from_millis(500);
@@ -55,6 +96,12 @@ pub enum Cmd {
     MessageAddress(String),
     #[command(description = "forget all sent ad IDs (next check re-sends every ad)")]
     ClearHistory,
+    #[command(description = "admin: list chats allowed to use the bot")]
+    Chats,
+    #[command(description = "admin: allow a chat to use the bot: /allow <chat_id>")]
+    Allow(String),
+    #[command(description = "admin: remove a chat's access: /deny <chat_id>")]
+    Deny(String),
 }
 
 fn user_label(msg: &Message) -> String {
@@ -86,6 +133,9 @@ fn cmd_label(cmd: &Cmd) -> &'static str {
         Cmd::Message(_) => "/message",
         Cmd::MessageAddress(_) => "/message_address",
         Cmd::ClearHistory => "/clear_history",
+        Cmd::Chats => "/chats",
+        Cmd::Allow(_) => "/allow",
+        Cmd::Deny(_) => "/deny",
     }
 }
 
@@ -97,12 +147,42 @@ Is it still available? I'd love to arrange a viewing at your convenience. Thank 
 
 /// Substitute `{address}`/`{price}`/`{beds}`/`{url}` placeholders in an enquiry
 /// template with a listing's details. Unknown placeholders are left untouched.
+/// Also fills square-bracket placeholders like `[address / advert title]` — any
+/// `[...]` whose text mentions address/advert/title becomes the listing address,
+/// so templates pasted with brackets work without switching to `{address}`.
 fn fill_template(template: &str, l: &Listing) -> String {
-    template
+    let filled = template
         .replace("{address}", &l.title)
         .replace("{price}", l.price.as_deref().unwrap_or(""))
         .replace("{beds}", l.bedrooms.as_deref().unwrap_or(""))
-        .replace("{url}", &l.url)
+        .replace("{url}", &l.url);
+    fill_address_brackets(&filled, &l.title)
+}
+
+/// Replace any `[...]` span whose inner text mentions "address", "advert" or
+/// "title" with `address`. Other bracketed text is left untouched.
+fn fill_address_brackets(s: &str, address: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(open) = rest.find('[') {
+        out.push_str(&rest[..open]);
+        if let Some(close_rel) = rest[open + 1..].find(']') {
+            let close = open + 1 + close_rel; // index of ']'
+            let inner = rest[open + 1..close].to_lowercase();
+            if inner.contains("address") || inner.contains("advert") || inner.contains("title") {
+                out.push_str(address);
+            } else {
+                out.push_str(&rest[open..=close]); // keep bracket text as-is
+            }
+            rest = &rest[close + 1..];
+        } else {
+            // No closing bracket — emit the rest verbatim and stop.
+            out.push_str(&rest[open..]);
+            return out;
+        }
+    }
+    out.push_str(rest);
+    out
 }
 
 /// Multi-line state summary used in /watch, /status and /start_watching replies.
@@ -275,8 +355,23 @@ pub async fn handle_cmd(
     state: SharedState,
     http: HttpClient,
     google_key: SharedKey,
+    admin: SharedAdmin,
 ) -> ResponseResult<()> {
     let chat_id = msg.chat.id.0;
+    let admin_id: Option<i64> = *admin;
+    {
+        let mut s = state.lock().await;
+        if !chat_served(&s, admin_id, chat_id) {
+            log::warn!("[reject] chat={chat_id} user={} cmd={} (not allowed)", user_label(&msg), cmd_label(&cmd));
+            crate::audit::event(
+                "REJECT",
+                format!("chat={chat_id} user={} kind=cmd cmd={}", user_label(&msg), cmd_label(&cmd)),
+            );
+            return Ok(());
+        }
+        // Keep the stored label fresh for /chats display.
+        s.touch_chat_label(chat_id, &chat_label(&msg.chat));
+    }
     log::info!(
         "[cmd] chat={chat_id} user={} -> {}",
         user_label(&msg),
@@ -713,6 +808,107 @@ pub async fn handle_cmd(
             )
             .await?;
         }
+        Cmd::Chats => {
+            if !is_admin(admin_id, chat_id) {
+                bot.send_message(msg.chat.id, "🔒 Only the admin chat can view or manage allowed chats.")
+                    .await?;
+                return Ok(());
+            }
+            let list = { state.lock().await.allowed_list() };
+            let mut lines = Vec::new();
+            for (id, stored) in &list {
+                // Refresh the label from Telegram when possible, and persist it.
+                let fresh = bot.get_chat(ChatId(*id)).await.ok().map(|c| chat_label(&c));
+                if let Some(n) = fresh.as_ref().filter(|s| !s.is_empty()) {
+                    let mut s = state.lock().await;
+                    s.touch_chat_label(*id, n);
+                    let _ = s.save().await;
+                }
+                let name = fresh
+                    .filter(|s| !s.is_empty())
+                    .or_else(|| (!stored.is_empty()).then(|| stored.clone()))
+                    .unwrap_or_else(|| "(name unknown)".to_string());
+                let tag = if is_admin(admin_id, *id) { " — <b>admin</b>" } else { "" };
+                lines.push(format!("• {} — <code>{}</code>{}", html_escape(&name), id, tag));
+            }
+            let body = if lines.is_empty() {
+                "No chats allowed yet. Add one with <code>/allow &lt;chat_id&gt;</code>.".to_string()
+            } else {
+                lines.join("\n")
+            };
+            bot.send_message(msg.chat.id, format!("<b>Allowed chats ({})</b>\n{body}", list.len()))
+                .parse_mode(ParseMode::Html)
+                .await?;
+        }
+        Cmd::Allow(arg) => {
+            if !is_admin(admin_id, chat_id) {
+                bot.send_message(msg.chat.id, "🔒 Only the admin chat can allow chats.")
+                    .await?;
+                return Ok(());
+            }
+            let target: i64 = match arg.trim().parse() {
+                Ok(v) => v,
+                Err(_) => {
+                    bot.send_message(msg.chat.id, "Usage: /allow <chat_id>\nExample: /allow -5091539690")
+                        .await?;
+                    return Ok(());
+                }
+            };
+            let label = bot
+                .get_chat(ChatId(target))
+                .await
+                .ok()
+                .map(|c| chat_label(&c))
+                .unwrap_or_default();
+            let newly = {
+                let mut s = state.lock().await;
+                let n = s.allow_chat(target, &label);
+                let _ = s.save().await;
+                n
+            };
+            crate::audit::event(
+                "ALLOW",
+                format!("admin={chat_id} target={target} newly={newly} label={label:?}"),
+            );
+            let shown = if label.is_empty() { "(name unknown)".to_string() } else { html_escape(&label) };
+            let verb = if newly { "Allowed" } else { "Already allowed; refreshed" };
+            bot.send_message(msg.chat.id, format!("✅ {verb}: {shown} — <code>{target}</code>"))
+                .parse_mode(ParseMode::Html)
+                .await?;
+        }
+        Cmd::Deny(arg) => {
+            if !is_admin(admin_id, chat_id) {
+                bot.send_message(msg.chat.id, "🔒 Only the admin chat can remove chats.")
+                    .await?;
+                return Ok(());
+            }
+            let target: i64 = match arg.trim().parse() {
+                Ok(v) => v,
+                Err(_) => {
+                    bot.send_message(msg.chat.id, "Usage: /deny <chat_id>\nExample: /deny -5091539690")
+                        .await?;
+                    return Ok(());
+                }
+            };
+            if is_admin(admin_id, target) {
+                bot.send_message(msg.chat.id, "⚠ That's the admin chat — it stays allowed and can't remove itself.")
+                    .await?;
+                return Ok(());
+            }
+            let removed = {
+                let mut s = state.lock().await;
+                let r = s.deny_chat(target);
+                let _ = s.save().await;
+                r
+            };
+            crate::audit::event("DENY", format!("admin={chat_id} target={target} removed={removed}"));
+            let body = if removed {
+                format!("🚫 Removed access for <code>{target}</code>. That chat is now ignored.")
+            } else {
+                format!("Nothing to do — <code>{target}</code> wasn't on the allowlist.")
+            };
+            bot.send_message(msg.chat.id, body).parse_mode(ParseMode::Html).await?;
+        }
     }
 
     Ok(())
@@ -724,8 +920,22 @@ pub async fn handle_text(
     state: SharedState,
     http: HttpClient,
     google_key: SharedKey,
+    admin: SharedAdmin,
 ) -> ResponseResult<()> {
     let chat_id = msg.chat.id.0;
+    let admin_id: Option<i64> = *admin;
+    {
+        let mut s = state.lock().await;
+        if !chat_served(&s, admin_id, chat_id) {
+            log::warn!("[reject] chat={chat_id} user={} text (not allowed)", user_label(&msg));
+            crate::audit::event(
+                "REJECT",
+                format!("chat={chat_id} user={} kind=text", user_label(&msg)),
+            );
+            return Ok(());
+        }
+        s.touch_chat_label(chat_id, &chat_label(&msg.chat));
+    }
 
     // Telegram "Send Location" attachment → set as work point.
     if let Some(loc) = msg.location() {
@@ -1434,12 +1644,14 @@ pub async fn poll_loop(
     state: SharedState,
     http: HttpClient,
     google_key: SharedKey,
+    admin: SharedAdmin,
     interval_secs: u64,
 ) {
     let mut ticker = tokio::time::interval(std::time::Duration::from_secs(interval_secs));
     ticker.tick().await; // burn the immediate-first tick
     log::info!("[poll] loop armed, interval={interval_secs}s");
 
+    let admin_id: Option<i64> = *admin;
     let mut tick_n: u64 = 0;
     loop {
         ticker.tick().await;
@@ -1447,12 +1659,22 @@ pub async fn poll_loop(
 
         let (snapshot, paused, sleeping) = {
             let s = state.lock().await;
+            // Restricted mode when an admin or any allowlisted chat exists.
+            let open = admin_id.is_none() && s.allowed_chats.is_empty();
+            let allowed = &s.allowed_chats;
             let mut paused = 0usize;
             let mut sleeping_n = 0usize;
             let snap: Vec<(i64, String)> = s
                 .chats
                 .iter()
-                .filter(|(_, chat)| {
+                .filter(|(cid_str, chat)| {
+                    // Never poll a chat that isn't served (admin or allowlisted),
+                    // even if it somehow has stored watches.
+                    let cid: i64 = cid_str.parse().unwrap_or(0);
+                    let served = open || admin_id == Some(cid) || allowed.contains_key(&cid.to_string());
+                    if !served {
+                        return false;
+                    }
                     if !chat.active {
                         paused += 1;
                         return false;
@@ -1610,10 +1832,37 @@ async fn handle_map(
 
 #[cfg(test)]
 mod tests {
-    use super::parse_coords;
+    use super::{fill_address_brackets, parse_coords};
 
     fn approx(a: f64, b: f64) -> bool {
         (a - b).abs() < 1e-6
+    }
+
+    #[test]
+    fn brackets_address_variants_filled() {
+        let addr = "234 Maple Woods, Ballinacurra, Co. Cork";
+        for tmpl in [
+            "Subject: Viewing request — [address / advert title]",
+            "Subject: Viewing request — [address/ advert title]",
+            "Subject: Viewing request — [ADDRESS]",
+            "Re: [advert title] follow-up",
+        ] {
+            let out = fill_address_brackets(tmpl, addr);
+            assert!(out.contains(addr), "not filled: {tmpl} -> {out}");
+            assert!(!out.contains('['), "bracket left: {out}");
+        }
+    }
+
+    #[test]
+    fn brackets_unrelated_left_untouched() {
+        let out = fill_address_brackets("Note [see below] and [address here]", "X ST");
+        assert_eq!(out, "Note [see below] and X ST");
+    }
+
+    #[test]
+    fn brackets_unclosed_is_safe() {
+        let out = fill_address_brackets("dangling [address with no close", "X ST");
+        assert_eq!(out, "dangling [address with no close");
     }
 
     #[test]
