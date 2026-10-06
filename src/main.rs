@@ -294,12 +294,70 @@ async fn run_bot() -> Result<()> {
         )
         .branch(Update::filter_callback_query().endpoint(bot::handle_callback));
 
+    // Custom polling error handler: make a "webhook conflict" (which means the
+    // token is being used elsewhere) impossible to miss in the console, instead
+    // of blending into ordinary retry logs.
+    let listener = teloxide::update_listeners::polling_default(bot.clone()).await;
     Dispatcher::builder(bot, handler)
         .dependencies(dptree::deps![state, http, google_key, admin])
         .enable_ctrlc_handler()
         .build()
-        .dispatch()
+        .dispatch_with_listener(listener, Arc::new(PollingErrorHandler))
         .await;
 
     Ok(())
+}
+
+/// Error handler for the update-listener (long-polling). A
+/// `Conflict: can't use getUpdates ... webhook is active` means someone set a
+/// webhook on the bot — i.e. the token is live somewhere else. We print a loud,
+/// throttled banner telling the operator to rotate the token.
+struct PollingErrorHandler;
+
+static LAST_WEBHOOK_BANNER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+impl teloxide::error_handlers::ErrorHandler<teloxide::RequestError> for PollingErrorHandler {
+    fn handle_error(
+        self: Arc<Self>,
+        error: teloxide::RequestError,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'static>> {
+        let text = error.to_string();
+        let is_webhook_conflict =
+            text.contains("webhook is active") || text.contains("can't use getUpdates");
+
+        if is_webhook_conflict {
+            use std::sync::atomic::Ordering;
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            // Throttle the big banner to once per 5 minutes; keep a one-liner in between.
+            if now.saturating_sub(LAST_WEBHOOK_BANNER.load(Ordering::Relaxed)) >= 300 {
+                LAST_WEBHOOK_BANNER.store(now, Ordering::Relaxed);
+                eprintln!(
+                    "\n\
+=================================================================\n\
+  ⚠  ВНИМАНИЕ: СМЕНИТЕ ТОКЕН — обнаружен ЧУЖОЙ webhook  ⚠\n\
+-----------------------------------------------------------------\n\
+  Telegram: на боте установлен webhook, getUpdates заблокирован.\n\
+  Бот НЕ принимает команды. Токен, вероятно, используется где-то\n\
+  ещё (утёк).\n\
+\n\
+  ДЕЙСТВИЕ:  @BotFather  ->  /revoke  ->  новый токен в .env\n\
+             ->  перезапустить бота.\n\
+  Проверить источник:  getWebhookInfo по API бота.\n\
+=================================================================\n"
+                );
+                log::error!(
+                    "WEBHOOK CONFLICT — foreign webhook active; token likely leaked. \
+                     Rotate it in @BotFather and update .env. ({text})"
+                );
+            } else {
+                log::error!("webhook conflict still active (token not changed yet): {text}");
+            }
+        } else {
+            log::error!("update listener error: {text}");
+        }
+        Box::pin(async {})
+    }
 }
